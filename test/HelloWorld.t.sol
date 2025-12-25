@@ -22,30 +22,36 @@ contract HelloWorldTest is Test {
         emu.poke8(0xFFFC, 0x00);
         emu.poke8(0xFFFD, 0xA0);
 
-        // Patch EhBASIC CHROUT soft vector ($0302/0303) to a stub at $F010
-        // that stores A to IO_TTY ($F001) then RTS. High‑RAM is less likely
-        // to be clobbered by the interpreter.
-        emu.poke8(0xF010, 0x8D); // STA abs
-        emu.poke8(0xF011, 0x01);
-        emu.poke8(0xF012, 0xF0); // $F001
-        emu.poke8(0xF013, 0x60); // RTS
+        // Patch EhBASIC CHROUT soft vector ($0302/0303) to a stub at $F800
+        // that stores A to IO_TTY ($F001) then RTS.
+        // IMPORTANT: Use $F800+ range, NOT $F000-$F0FF which is I/O space!
+        emu.poke8(0xF800, 0x8D); // STA abs
+        emu.poke8(0xF801, 0x01);
+        emu.poke8(0xF802, 0xF0); // $F001
+        emu.poke8(0xF803, 0x60); // RTS
 
-        emu.poke8(0x0302, 0x10); // low byte (0x10)
-        emu.poke8(0x0303, 0xF0); // high byte (0xF0)
+        emu.poke8(0x0302, 0x00); // low byte (0x00)
+        emu.poke8(0x0303, 0xF8); // high byte (0xF8)
 
-        // Re‑patch CHRIN vector as well
-        emu.poke8(0x0300, 0x30);
-        emu.poke8(0x0301, 0xF0);
+        // Patch CHRIN vector ($0300/0301) to stub at $F810
+        // that reads from IO_KBD ($F000) into A then RTS.
+        emu.poke8(0xF810, 0xAD); // LDA abs
+        emu.poke8(0xF811, 0x00);
+        emu.poke8(0xF812, 0xF0); // $F000
+        emu.poke8(0xF813, 0x60); // RTS
+
+        emu.poke8(0x0300, 0x10); // low byte
+        emu.poke8(0x0301, 0xF8); // high byte
 
         // Power‑on reset
         emu.boot();
 
         // Install a minimal BRK/IRQ handler that simply RTI so that EhBASIC's
         // use of BRK as a soft interrupt does not crash into uninitialised
-        // vector memory during early startup.  Vector at $FFFE/$FFFF → $F020.
-        emu.poke8(0xF020, 0x40); // RTI
-        emu.poke8(0xFFFE, 0x20); // low byte of $F020
-        emu.poke8(0xFFFF, 0xF0); // high byte
+        // vector memory during early startup.  Vector at $FFFE/$FFFF → $F820.
+        emu.poke8(0xF820, 0x40); // RTI
+        emu.poke8(0xFFFE, 0x20); // low byte of $F820
+        emu.poke8(0xFFFF, 0xF8); // high byte
 
         // Enable PC tracing so we can see where the interpreter executes
         emu.setPCTrace(true);
@@ -107,12 +113,24 @@ contract HelloWorldTest is Test {
         emu.sendKeys("C\r\r");
 
         // Re‑patch CHROUT vector in case EhBASIC overwrote it during init
-        emu.poke8(0x0302, 0x10);
-        emu.poke8(0x0303, 0xF0);
+        emu.poke8(0x0302, 0x00);
+        emu.poke8(0x0303, 0xF8);
 
         // Re‑patch CHRIN vector as well
-        emu.poke8(0x0300, 0x30);
-        emu.poke8(0x0301, 0xF0);
+        emu.poke8(0x0300, 0x10);
+        emu.poke8(0x0301, 0xF8);
+
+        // Re-write I/O handler code in case it was overwritten
+        // CHROUT at $F800
+        emu.poke8(0xF800, 0x8D); // STA abs
+        emu.poke8(0xF801, 0x01);
+        emu.poke8(0xF802, 0xF0); // $F001
+        emu.poke8(0xF803, 0x60); // RTS
+        // CHRIN at $F810
+        emu.poke8(0xF810, 0xAD); // LDA abs
+        emu.poke8(0xF811, 0x00);
+        emu.poke8(0xF812, 0xF0); // $F000
+        emu.poke8(0xF813, 0x60); // RTS
 
         // Send BASIC program and run it
         emu.sendKeys("10 PRINT \"HELLO\"\rRUN\r");

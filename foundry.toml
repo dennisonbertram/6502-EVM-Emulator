@@ -9,4 +9,6 @@ libs = ["lib"]
 fs_permissions = [
   # allow tests to read the EhBASIC image and any other ROM assets
   { access = "read", path = "./rom" },
+  # allow tests to read Klaus functional test binary
+  { access = "read", path = "./test/fixtures" },
 ]

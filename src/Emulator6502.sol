@@ -1237,6 +1237,8 @@ contract Emulator6502 {
             _opBVS();
         } else if (opcode == 0x00) {
             _opBRK();
+        } else if (opcode == 0x02) {
+            _opHLT(); // Undefined opcode used as HALT
         } else if (opcode == 0x40) {
             _opRTI();
         } else if (opcode == 0x85) {
@@ -1469,6 +1471,14 @@ contract Emulator6502 {
         // interrupt.  Execution continues from the handler pointed to by
         // the IRQ/BRK vector at `$FFFE/$FFFF`.
         _serviceInterrupt(VECTOR_IRQ, true);
+    }
+
+    // --- HLT opcode (undefined $02, commonly used as HALT/KIL/JAM) ---
+    function _opHLT() internal {
+        // Set the halted flag to stop the run() loop.
+        // Unlike BRK (which is a software interrupt), HLT truly stops execution.
+        // This is an undefined opcode on the NMOS 6502, repurposed here for clean halting.
+        halted = true;
     }
 
     // --- Interrupt return opcode ---
