@@ -56,6 +56,9 @@ contract Emulator6502 {
     // Memory‑mapped IO addresses
     uint16 private constant IO_KBD = 0xF000; // Keyboard input register (read)
     uint16 private constant IO_TTY = 0xF001; // Terminal output register (write)
+    // ACIA-compatible I/O for EhBASIC ROM (which expects 6850 ACIA at $8800)
+    uint16 private constant ACIA_DATA = 0x8800;   // ACIA data register
+    uint16 private constant ACIA_STATUS = 0x8801; // ACIA status register
 
     /*//////////////////////////////////////////////////////////////////////////
                                    EVENTS
@@ -175,17 +178,44 @@ contract Emulator6502 {
     function _adc(uint8 value) internal {
         uint8 a = cpu.A;
         uint8 carryIn = _getFlag(FLAG_CARRY) ? 1 : 0;
-        uint16 sum = uint16(a) + uint16(value) + uint16(carryIn);
-        uint8 result = uint8(sum);
 
-        // Carry flag
-        _setFlag(FLAG_CARRY, sum > 0xFF);
-        // Overflow flag: set if (~(A ^ V) & (A ^ R)) bit 7 set
-        bool overflow = ((~(a ^ value) & (a ^ result)) & 0x80) != 0;
-        _setFlag(FLAG_OVERFLOW, overflow);
+        if (_getFlag(FLAG_DECIMAL)) {
+            // BCD mode - NMOS 6502 decimal arithmetic
+            uint8 lowNibble = (a & 0x0F) + (value & 0x0F) + carryIn;
+            uint8 highNibble = (a >> 4) + (value >> 4);
 
-        cpu.A = result;
-        _updateZN(result);
+            if (lowNibble > 9) {
+                lowNibble += 6;
+                highNibble += 1;
+            }
+            if (highNibble > 9) {
+                highNibble += 6;
+            }
+
+            uint8 result = ((highNibble & 0x0F) << 4) | (lowNibble & 0x0F);
+            _setFlag(FLAG_CARRY, highNibble > 0x0F);
+
+            // NMOS 6502: N and Z flags based on binary result, V undefined (we compute from binary)
+            uint16 binSum = uint16(a) + uint16(value) + uint16(carryIn);
+            _setFlag(FLAG_NEGATIVE, (binSum & 0x80) != 0);
+            _setFlag(FLAG_ZERO, uint8(binSum) == 0);
+            bool overflow = ((~(a ^ value) & (a ^ uint8(binSum))) & 0x80) != 0;
+            _setFlag(FLAG_OVERFLOW, overflow);
+
+            cpu.A = result;
+        } else {
+            // Binary mode
+            uint16 sum = uint16(a) + uint16(value) + uint16(carryIn);
+            uint8 result = uint8(sum);
+
+            _setFlag(FLAG_CARRY, sum > 0xFF);
+            // Overflow flag: set if (~(A ^ V) & (A ^ R)) bit 7 set
+            bool overflow = ((~(a ^ value) & (a ^ result)) & 0x80) != 0;
+            _setFlag(FLAG_OVERFLOW, overflow);
+
+            cpu.A = result;
+            _updateZN(result);
+        }
     }
 
     function _opADCImmediate() internal {
@@ -240,10 +270,45 @@ contract Emulator6502 {
         _adc(_read8(addr));
     }
 
-    // --- SBC helpers (uses ADC with value ^ 0xFF) ---
+    // --- SBC helpers ---
 
     function _sbc(uint8 value) internal {
-        _adc(value ^ 0xFF);
+        uint8 a = cpu.A;
+        uint8 borrowIn = _getFlag(FLAG_CARRY) ? 0 : 1; // Carry clear = borrow
+
+        if (_getFlag(FLAG_DECIMAL)) {
+            // BCD mode subtraction
+            // Use int16 to handle negative intermediate values
+            int16 lowNibble = int16(uint16(a & 0x0F)) - int16(uint16(value & 0x0F)) - int16(uint16(borrowIn));
+            int16 highNibble = int16(uint16(a >> 4)) - int16(uint16(value >> 4));
+
+            if (lowNibble < 0) {
+                lowNibble += 10; // BCD correction (add 10, which is -6 mod 16)
+                highNibble -= 1; // borrow from high nibble
+            }
+
+            bool finalBorrow = highNibble < 0;
+            if (highNibble < 0) {
+                highNibble += 10; // BCD correction
+            }
+
+            // Assemble result from low 4 bits of each nibble
+            uint8 result = uint8(uint16(highNibble & 0x0F) << 4) | uint8(uint16(lowNibble) & 0x0F);
+            _setFlag(FLAG_CARRY, !finalBorrow); // Carry set if no borrow
+
+            // NMOS 6502: N, Z, V flags from binary result
+            int16 binResult = int16(uint16(a)) - int16(uint16(value)) - int16(uint16(borrowIn));
+            uint8 binResult8 = uint8(uint16(binResult) & 0xFF);
+            _setFlag(FLAG_NEGATIVE, (binResult8 & 0x80) != 0);
+            _setFlag(FLAG_ZERO, binResult8 == 0);
+            bool overflow = (((a ^ value) & (a ^ binResult8)) & 0x80) != 0;
+            _setFlag(FLAG_OVERFLOW, overflow);
+
+            cpu.A = result;
+        } else {
+            // Binary mode - use ADC with ones complement
+            _adc(value ^ 0xFF);
+        }
     }
 
     function _opSBCImmediate() internal {
@@ -376,26 +441,9 @@ contract Emulator6502 {
         RAM = new bytes(65536);
     }
 
-    /// @dev Read an 8‑bit value from RAM
-    function _read8(uint16 addr) internal view returns (uint8) {
-        if (addr == IO_KBD) {
-            // read from keyboard register – handled in non‑view wrapper
-            return 0;
-        }
-        return uint8(RAM[addr]);
-    }
-
-    /// @dev Write an 8‑bit value to RAM
-    function _write8(uint16 addr, uint8 value) internal {
-        // Terminal output – emit event
-        if (addr == IO_TTY) {
-            emit CharOut(value);
-        }
-        RAM[addr] = bytes1(value);
-    }
-
-    // Non‑view wrapper to allow mutating keyPos
-    function _read8(uint16 addr, bool mutate) internal returns (uint8) {
+    /// @dev Read an 8-bit value from RAM (non-view to support keyboard I/O)
+    function _read8(uint16 addr) internal returns (uint8) {
+        // Original I/O at $F000
         if (addr == IO_KBD) {
             uint8 val;
             if (keyPos < keyBuffer.length) {
@@ -406,8 +454,44 @@ contract Emulator6502 {
             }
             return val;
         }
+        // ACIA data register at $8800 - returns keyboard char (consumes from buffer)
+        if (addr == ACIA_DATA) {
+            uint8 val;
+            if (keyPos < keyBuffer.length) {
+                val = uint8(keyBuffer[keyPos]);
+                keyPos += 1;
+            } else {
+                val = 0;
+            }
+            return val;
+        }
+        // ACIA status register at $8801
+        // Bit 0: RDRF (Receive Data Register Full) - set if keyboard data available
+        // Bit 1: TDRE (Transmit Data Register Empty) - always set (ready to send)
+        // EhBASIC checks bit 3 for RDRF and bit 4 for TDRE (6850 ACIA)
+        if (addr == ACIA_STATUS) {
+            uint8 status = 0x10; // TDRE always set (bit 4)
+            if (keyPos < keyBuffer.length) {
+                status |= 0x08; // RDRF set (bit 3) if data available
+            }
+            return status;
+        }
         return uint8(RAM[addr]);
     }
+
+    /// @dev Write an 8‑bit value to RAM
+    function _write8(uint16 addr, uint8 value) internal {
+        // Terminal output – emit event
+        if (addr == IO_TTY) {
+            emit CharOut(value);
+        }
+        // ACIA data register write = terminal output
+        if (addr == ACIA_DATA) {
+            emit CharOut(value);
+        }
+        RAM[addr] = bytes1(value);
+    }
+
 
     /*//////////////////////////////////////////////////////////////////////////
                                    FLAG HELPERS
@@ -431,7 +515,8 @@ contract Emulator6502 {
 
     /// @notice Expose RAM peek for tests
     function peek8(uint16 addr) external view returns (uint8) {
-        return _read8(addr);
+        // Read directly from RAM for diagnostics (doesn't consume keyboard buffer)
+        return uint8(RAM[addr]);
     }
 
     /// @notice Expose RAM poke for tests
@@ -488,7 +573,7 @@ contract Emulator6502 {
 
     // Read IO for testing (mutates key buffer)
     function testReadIO(uint16 addr) external returns (uint8) {
-        return _read8(addr, true);
+        return _read8(addr);
     }
 
     /*//////////////////////////////////////////////////////////////////////////
@@ -497,7 +582,7 @@ contract Emulator6502 {
 
     /// @dev Fetch next byte at PC and increment PC
     function _fetch8() internal returns (uint8 val) {
-        val = _read8(cpu.PC, false);
+        val = _read8(cpu.PC);
         unchecked {
             cpu.PC += 1;
         }
@@ -613,40 +698,40 @@ contract Emulator6502 {
         _and(_fetch8());
     }
     function _opANDZeroPage() internal {
-        _and(_read8(uint16(_fetch8()), false));
+        _and(_read8(uint16(_fetch8())));
     }
     function _opANDZeroPageX() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.X;
         }
-        _and(_read8(uint16(b), false));
+        _and(_read8(uint16(b)));
     }
     function _opANDAbsolute() internal {
-        _and(_read8(_fetch16(), false));
+        _and(_read8(_fetch16()));
     }
     function _opANDAbsoluteX() internal {
         uint16 base = _fetch16();
-        _and(_read8(base + cpu.X, false));
+        _and(_read8(base + cpu.X));
     }
     function _opANDAbsoluteY() internal {
         uint16 base = _fetch16();
-        _and(_read8(base + cpu.Y, false));
+        _and(_read8(base + cpu.Y));
     }
     function _opANDIndexedIndirect() internal {
         uint8 p = _fetch8();
         unchecked {
             p += cpu.X;
         }
-        uint16 addr = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(_zpNext(p)), false)) << 8);
-        _and(_read8(addr, false));
+        uint16 addr = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(_zpNext(p)))) << 8);
+        _and(_read8(addr));
     }
     function _opANDIndirectIndexed() internal {
         uint8 p = _fetch8();
-        uint16 base = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(uint8(p + 1)), false)) << 8);
-        _and(_read8(base + cpu.Y, false));
+        uint16 base = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(uint8(p + 1)))) << 8);
+        _and(_read8(base + cpu.Y));
     }
 
     // --- ORA helpers ---
@@ -659,40 +744,40 @@ contract Emulator6502 {
         _ora(_fetch8());
     }
     function _opORAZeroPage() internal {
-        _ora(_read8(uint16(_fetch8()), false));
+        _ora(_read8(uint16(_fetch8())));
     }
     function _opORAZeroPageX() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.X;
         }
-        _ora(_read8(uint16(b), false));
+        _ora(_read8(uint16(b)));
     }
     function _opORAAbsolute() internal {
-        _ora(_read8(_fetch16(), false));
+        _ora(_read8(_fetch16()));
     }
     function _opORAAbsoluteX() internal {
         uint16 base = _fetch16();
-        _ora(_read8(base + cpu.X, false));
+        _ora(_read8(base + cpu.X));
     }
     function _opORAAbsoluteY() internal {
         uint16 base = _fetch16();
-        _ora(_read8(base + cpu.Y, false));
+        _ora(_read8(base + cpu.Y));
     }
     function _opORAIndexedIndirect() internal {
         uint8 p = _fetch8();
         unchecked {
             p += cpu.X;
         }
-        uint16 a = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(_zpNext(p)), false)) << 8);
-        _ora(_read8(a, false));
+        uint16 a = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(_zpNext(p)))) << 8);
+        _ora(_read8(a));
     }
     function _opORAIndirectIndexed() internal {
         uint8 p = _fetch8();
-        uint16 base = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(uint8(p + 1)), false)) << 8);
-        _ora(_read8(base + cpu.Y, false));
+        uint16 base = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(uint8(p + 1)))) << 8);
+        _ora(_read8(base + cpu.Y));
     }
 
     // --- EOR helpers ---
@@ -705,40 +790,40 @@ contract Emulator6502 {
         _eor(_fetch8());
     }
     function _opEORZeroPage() internal {
-        _eor(_read8(uint16(_fetch8()), false));
+        _eor(_read8(uint16(_fetch8())));
     }
     function _opEORZeroPageX() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.X;
         }
-        _eor(_read8(uint16(b), false));
+        _eor(_read8(uint16(b)));
     }
     function _opEORAbsolute() internal {
-        _eor(_read8(_fetch16(), false));
+        _eor(_read8(_fetch16()));
     }
     function _opEORAbsoluteX() internal {
         uint16 base = _fetch16();
-        _eor(_read8(base + cpu.X, false));
+        _eor(_read8(base + cpu.X));
     }
     function _opEORAbsoluteY() internal {
         uint16 base = _fetch16();
-        _eor(_read8(base + cpu.Y, false));
+        _eor(_read8(base + cpu.Y));
     }
     function _opEORIndexedIndirect() internal {
         uint8 p = _fetch8();
         unchecked {
             p += cpu.X;
         }
-        uint16 a = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(_zpNext(p)), false)) << 8);
-        _eor(_read8(a, false));
+        uint16 a = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(_zpNext(p)))) << 8);
+        _eor(_read8(a));
     }
     function _opEORIndirectIndexed() internal {
         uint8 p = _fetch8();
-        uint16 base = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(uint8(p + 1)), false)) << 8);
-        _eor(_read8(base + cpu.Y, false));
+        uint16 base = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(uint8(p + 1)))) << 8);
+        _eor(_read8(base + cpu.Y));
     }
 
     // --- BIT helper --- (affects Z = A & val ==0, N,V from val bits 7/6)
@@ -748,10 +833,10 @@ contract Emulator6502 {
         _setFlag(FLAG_OVERFLOW, (val & 0x40) != 0);
     }
     function _opBITZeroPage() internal {
-        _bit(_read8(uint16(_fetch8()), false));
+        _bit(_read8(uint16(_fetch8())));
     }
     function _opBITAbsolute() internal {
-        _bit(_read8(_fetch16(), false));
+        _bit(_read8(_fetch16()));
     }
 
     // --- Compare helpers ---
@@ -769,40 +854,40 @@ contract Emulator6502 {
         _cmp(cpu.A, _fetch8());
     }
     function _opCMPZeroPage() internal {
-        _cmp(cpu.A, _read8(uint16(_fetch8()), false));
+        _cmp(cpu.A, _read8(uint16(_fetch8())));
     }
     function _opCMPZeroPageX() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.X;
         }
-        _cmp(cpu.A, _read8(uint16(b), false));
+        _cmp(cpu.A, _read8(uint16(b)));
     }
     function _opCMPAbsolute() internal {
-        _cmp(cpu.A, _read8(_fetch16(), false));
+        _cmp(cpu.A, _read8(_fetch16()));
     }
     function _opCMPAbsoluteX() internal {
         uint16 base = _fetch16();
-        _cmp(cpu.A, _read8(base + cpu.X, false));
+        _cmp(cpu.A, _read8(base + cpu.X));
     }
     function _opCMPAbsoluteY() internal {
         uint16 base = _fetch16();
-        _cmp(cpu.A, _read8(base + cpu.Y, false));
+        _cmp(cpu.A, _read8(base + cpu.Y));
     }
     function _opCMPIndexedIndirect() internal {
         uint8 p = _fetch8();
         unchecked {
             p += cpu.X;
         }
-        uint16 a = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(_zpNext(p)), false)) << 8);
-        _cmp(cpu.A, _read8(a, false));
+        uint16 a = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(_zpNext(p)))) << 8);
+        _cmp(cpu.A, _read8(a));
     }
     function _opCMPIndirectIndexed() internal {
         uint8 p = _fetch8();
-        uint16 base = uint16(_read8(uint16(p), false)) |
-            (uint16(_read8(uint16(uint8(p + 1)), false)) << 8);
-        _cmp(cpu.A, _read8(base + cpu.Y, false));
+        uint16 base = uint16(_read8(uint16(p))) |
+            (uint16(_read8(uint16(uint8(p + 1)))) << 8);
+        _cmp(cpu.A, _read8(base + cpu.Y));
     }
 
     // CPX
@@ -810,10 +895,10 @@ contract Emulator6502 {
         _cmp(cpu.X, _fetch8());
     }
     function _opCPXZeroPage() internal {
-        _cmp(cpu.X, _read8(uint16(_fetch8()), false));
+        _cmp(cpu.X, _read8(uint16(_fetch8())));
     }
     function _opCPXAbsolute() internal {
-        _cmp(cpu.X, _read8(_fetch16(), false));
+        _cmp(cpu.X, _read8(_fetch16()));
     }
 
     // CPY
@@ -821,10 +906,10 @@ contract Emulator6502 {
         _cmp(cpu.Y, _fetch8());
     }
     function _opCPYZeroPage() internal {
-        _cmp(cpu.Y, _read8(uint16(_fetch8()), false));
+        _cmp(cpu.Y, _read8(uint16(_fetch8())));
     }
     function _opCPYAbsolute() internal {
-        _cmp(cpu.Y, _read8(_fetch16(), false));
+        _cmp(cpu.Y, _read8(_fetch16()));
     }
 
     // --- Shift / Rotate helpers ---
@@ -860,7 +945,7 @@ contract Emulator6502 {
     }
     function _opASLZeroPage() internal {
         uint16 addr = uint16(_fetch8());
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _asl(v);
         _write8(addr, r);
     }
@@ -870,20 +955,20 @@ contract Emulator6502 {
             b += cpu.X;
         }
         uint16 addr = uint16(b);
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _asl(v);
         _write8(addr, r);
     }
     function _opASLAbsolute() internal {
         uint16 addr = _fetch16();
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _asl(v);
         _write8(addr, r);
     }
     function _opASLAbsoluteX() internal {
         uint16 base = _fetch16();
         uint16 addr = base + cpu.X;
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _asl(v);
         _write8(addr, r);
     }
@@ -894,7 +979,7 @@ contract Emulator6502 {
     }
     function _opLSRZeroPage() internal {
         uint16 addr = uint16(_fetch8());
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _lsr(v);
         _write8(addr, r);
     }
@@ -904,20 +989,20 @@ contract Emulator6502 {
             b += cpu.X;
         }
         uint16 addr = uint16(b);
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _lsr(v);
         _write8(addr, r);
     }
     function _opLSRAbsolute() internal {
         uint16 addr = _fetch16();
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _lsr(v);
         _write8(addr, r);
     }
     function _opLSRAbsoluteX() internal {
         uint16 base = _fetch16();
         uint16 addr = base + cpu.X;
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _lsr(v);
         _write8(addr, r);
     }
@@ -928,7 +1013,7 @@ contract Emulator6502 {
     }
     function _opROLZeroPage() internal {
         uint16 addr = uint16(_fetch8());
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _rol(v);
         _write8(addr, r);
     }
@@ -938,20 +1023,20 @@ contract Emulator6502 {
             b += cpu.X;
         }
         uint16 addr = uint16(b);
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _rol(v);
         _write8(addr, r);
     }
     function _opROLAbsolute() internal {
         uint16 addr = _fetch16();
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _rol(v);
         _write8(addr, r);
     }
     function _opROLAbsoluteX() internal {
         uint16 base = _fetch16();
         uint16 addr = base + cpu.X;
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _rol(v);
         _write8(addr, r);
     }
@@ -962,7 +1047,7 @@ contract Emulator6502 {
     }
     function _opRORZeroPage() internal {
         uint16 addr = uint16(_fetch8());
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _ror(v);
         _write8(addr, r);
     }
@@ -972,20 +1057,20 @@ contract Emulator6502 {
             b += cpu.X;
         }
         uint16 addr = uint16(b);
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _ror(v);
         _write8(addr, r);
     }
     function _opRORAbsolute() internal {
         uint16 addr = _fetch16();
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _ror(v);
         _write8(addr, r);
     }
     function _opRORAbsoluteX() internal {
         uint16 base = _fetch16();
         uint16 addr = base + cpu.X;
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         uint8 r = _ror(v);
         _write8(addr, r);
     }
@@ -1690,7 +1775,7 @@ contract Emulator6502 {
 
     // --- INC / DEC memory helpers ---
     function _incMem(uint16 addr) internal {
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         unchecked {
             v += 1;
         }
@@ -1698,7 +1783,7 @@ contract Emulator6502 {
         _updateZN(v);
     }
     function _decMem(uint16 addr) internal {
-        uint8 v = _read8(addr, false);
+        uint8 v = _read8(addr);
         unchecked {
             v -= 1;
         }
@@ -1757,21 +1842,21 @@ contract Emulator6502 {
         _ldx(_fetch8());
     }
     function _opLDXZeroPage() internal {
-        _ldx(_read8(uint16(_fetch8()), false));
+        _ldx(_read8(uint16(_fetch8())));
     }
     function _opLDXZeroPageY() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.Y;
         }
-        _ldx(_read8(uint16(b), false));
+        _ldx(_read8(uint16(b)));
     }
     function _opLDXAbsolute() internal {
-        _ldx(_read8(_fetch16(), false));
+        _ldx(_read8(_fetch16()));
     }
     function _opLDXAbsoluteY() internal {
         uint16 base = _fetch16();
-        _ldx(_read8(base + cpu.Y, false));
+        _ldx(_read8(base + cpu.Y));
     }
 
     // LDY addressing modes
@@ -1779,21 +1864,21 @@ contract Emulator6502 {
         _ldy(_fetch8());
     }
     function _opLDYZeroPage() internal {
-        _ldy(_read8(uint16(_fetch8()), false));
+        _ldy(_read8(uint16(_fetch8())));
     }
     function _opLDYZeroPageX() internal {
         uint8 b = _fetch8();
         unchecked {
             b += cpu.X;
         }
-        _ldy(_read8(uint16(b), false));
+        _ldy(_read8(uint16(b)));
     }
     function _opLDYAbsolute() internal {
-        _ldy(_read8(_fetch16(), false));
+        _ldy(_read8(_fetch16()));
     }
     function _opLDYAbsoluteX() internal {
         uint16 base = _fetch16();
-        _ldy(_read8(base + cpu.X, false));
+        _ldy(_read8(base + cpu.X));
     }
 
     // --- JMP (indirect) ---

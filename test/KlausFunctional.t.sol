@@ -18,8 +18,8 @@ contract KlausFunctionalTest is Test {
 
     // Max steps to run (Klaus test takes ~26M cycles on real hardware)
     // Foundry has gas limits, so we run a limited validation
-    uint64 constant STEPS_PER_CHUNK = 50_000;
-    uint64 constant MAX_CHUNKS = 20; // 1M steps for quick validation
+    uint64 constant STEPS_PER_CHUNK = 100_000;
+    uint64 constant MAX_CHUNKS = 500; // 50M steps for thorough validation
 
     function setUp() public {
         emu = new Emulator6502();
@@ -54,12 +54,17 @@ contract KlausFunctionalTest is Test {
             } catch {
                 // Hit gas limit or unknown opcode - report current state
                 (,,,, currentPC,,) = emu.cpu();
+                // Check if we're stuck at a trap
+                if (_isAtTrap(currentPC) && currentPC != SUCCESS_ADDR) {
+                    _reportTrap(currentPC, totalSteps);
+                    return;
+                }
                 if (currentPC > 0x1000) {
                     emit log_string(string.concat(
-                        "Stopped at PC=$", _toHex16(currentPC),
+                        "Gas exhausted at PC=$", _toHex16(currentPC),
                         " after ", vm.toString(totalSteps), " steps"
                     ));
-                    assertTrue(true, "Klaus test making progress before error");
+                    assertTrue(true, "Klaus test making progress before gas limit");
                 } else {
                     assertTrue(false, string.concat("Failed early at PC=$", _toHex16(currentPC)));
                 }
@@ -99,15 +104,15 @@ contract KlausFunctionalTest is Test {
 
         // Ran out of budget - check if we made good progress
         (,,,, currentPC,,) = emu.cpu();
+        // Check if we're stuck at a trap (not at success addr)
+        if (_isAtTrap(currentPC) && currentPC != SUCCESS_ADDR) {
+            _reportTrap(currentPC, totalSteps);
+            return;
+        }
+
         // If we got past the early tests (>$1000) without trapping, that's partial success
         if (currentPC > 0x1000) {
-            emit log_string(string.concat(
-                "PARTIAL SUCCESS: Klaus test reached PC=$",
-                _toHex16(currentPC),
-                " after ",
-                vm.toString(totalSteps),
-                " steps (gas limit reached)"
-            ));
+            _reportState(currentPC, totalSteps, "Budget exhausted");
             // Pass - we made significant progress without hitting a trap
             assertTrue(true, "Klaus test making progress");
         } else {
@@ -145,9 +150,32 @@ contract KlausFunctionalTest is Test {
             " A=$", _toHex8(a),
             " X=$", _toHex8(x),
             " Y=$", _toHex8(y),
-            " P=$", _toHex8(p)
+            " P=$", _toHex8(p),
+            " after ", vm.toString(steps), " steps"
         ));
         assertTrue(false, string.concat("Trapped at $", _toHex16(pc)));
+    }
+
+    function _isAtTrap(uint16 pc) internal view returns (bool) {
+        uint8 opAtPC = emu.peek8(pc);
+        uint8 nextByte = emu.peek8(pc + 1);
+        // BNE $-2 (D0 FE) or JMP to self
+        return (opAtPC == 0xD0 && nextByte == 0xFE) ||
+               (opAtPC == 0x4C && emu.peek8(pc + 1) == uint8(pc & 0xFF) &&
+                emu.peek8(pc + 2) == uint8(pc >> 8));
+    }
+
+    function _reportState(uint16 pc, uint64 steps, string memory reason) internal {
+        uint8 op = emu.peek8(pc);
+        (uint8 a, uint8 x, uint8 y,,, uint8 p,) = emu.cpu();
+        emit log_named_string("Reason", reason);
+        emit log_named_string("PC", _toHex16(pc));
+        emit log_named_string("Opcode", _toHex8(op));
+        emit log_named_string("A", _toHex8(a));
+        emit log_named_string("X", _toHex8(x));
+        emit log_named_string("Y", _toHex8(y));
+        emit log_named_string("P (flags)", _toHex8(p));
+        emit log_named_uint("Steps", steps);
     }
 
     function _toHex16(uint16 val) internal pure returns (string memory) {

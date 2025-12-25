@@ -45,6 +45,30 @@ contract LoadRomScript is Script {
         emu.poke8(0xFFFE, lo); // IRQ/BRK
         emu.poke8(0xFFFF, hi);
 
+        // Patch EhBASIC I/O vectors for terminal output
+        // CHROUT stub at $0400: STA $F001; RTS
+        emu.poke8(0x0400, 0x8D); // STA abs
+        emu.poke8(0x0401, 0x01);
+        emu.poke8(0x0402, 0xF0); // $F001 (IO_TTY)
+        emu.poke8(0x0403, 0x60); // RTS
+
+        // Patch CHROUT vector at $0302/$0303
+        emu.poke8(0x0302, 0x00); // low byte
+        emu.poke8(0x0303, 0x04); // high byte -> $0400
+
+        // CHRIN stub at $0410: LDA $F000; RTS
+        emu.poke8(0x0410, 0xAD); // LDA abs
+        emu.poke8(0x0411, 0x00);
+        emu.poke8(0x0412, 0xF0); // $F000 (IO_KBD)
+        emu.poke8(0x0413, 0x60); // RTS
+
+        // Patch CHRIN vector at $0300/$0301
+        emu.poke8(0x0300, 0x10); // low byte
+        emu.poke8(0x0301, 0x04); // high byte -> $0410
+
+        // Install minimal BRK/IRQ handler at $020D
+        emu.poke8(0x020D, 0x40); // RTI
+
         // Boot CPU
         emu.boot();
 
