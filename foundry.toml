@@ -12,3 +12,5 @@ fs_permissions = [
   # allow tests to read Klaus functional test binary
   { access = "read", path = "./test/fixtures" },
 ]
+# Use solc instead of solar to avoid recursion limit issues
+use_literal_content = false
