@@ -35,15 +35,12 @@ contract LoadRomScript is Script {
         // Load ROM into emulator at specified base address
         emu.loadRomFrom(address(rom), uint16(baseAddr));
 
-        // Patch vectors (RESET, IRQ, NMI) to point to baseAddr for convenience
-        uint8 lo = uint8(baseAddr & 0xFF);
-        uint8 hi = uint8((baseAddr >> 8) & 0xFF);
-        emu.poke8(0xFFFC, lo);
-        emu.poke8(0xFFFD, hi);
-        emu.poke8(0xFFFA, lo); // NMI
-        emu.poke8(0xFFFB, hi);
-        emu.poke8(0xFFFE, lo); // IRQ/BRK
-        emu.poke8(0xFFFF, hi);
+        // NOTE: Do NOT patch RESET/IRQ/BRK vectors!
+        // The ROM at $C000-$FFFF contains correct vectors:
+        // - RESET at $FFFC-$FFFD points to EhBASIC entry point ($FF00)
+        // - IRQ/BRK at $FFFE-$FFFF points to ROM's BRK handler
+        // EhBASIC uses BRK as a soft interrupt, so we must not override these.
+        // We only install an RTI handler at $020D for the ROM's IRQ vector.
 
         // Patch EhBASIC I/O vectors for terminal output
         // CHROUT stub at $0400: STA $F001; RTS
