@@ -114,7 +114,7 @@ Read `CharOut(uint8)` logs to reconstruct terminal output. `TracePC` and `TraceJ
 
 ## Gas figures
 
-These come from my own `forge test` run (forge 1.7.1) and are the gas that forge reports for the whole test, including setup:
+These come from my own `forge test` run (forge 1.7.1) and are the gas that forge reports for the test function, which does not include the cost of `setUp()` (where the emulator is deployed and the ROM loaded):
 
 - `MiniRomHelloTest.test_miniRomPrintsHelloWorld`: 78,713,890 gas.
 - `HelloWorldTest.test_HelloWorld` (EhBASIC boot, 1,000,000 emulated steps): 9,167,382,272 gas.
