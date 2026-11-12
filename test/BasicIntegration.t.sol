@@ -25,13 +25,13 @@ contract BasicIntegrationTest is Test {
         emu.poke8(0xFFFD, 0x80);
 
         // Overwrite reset vector entry ($8000..) with stub:
-        // LDA #$34 ; STA $F001 ; BRK
+        // LDA #$34 ; STA $F001 ; HLT
         emu.poke8(0x8000, 0xA9); // LDA immediate
         emu.poke8(0x8001, 0x34); // value '4'
         emu.poke8(0x8002, 0x8D); // STA abs
         emu.poke8(0x8003, 0x01);
         emu.poke8(0x8004, 0xF0); // $F001
-        emu.poke8(0x8005, 0x00); // BRK – halts CPU
+        emu.poke8(0x8005, 0x02); // HLT – halts CPU
 
         emu.boot();
     }
@@ -58,6 +58,6 @@ contract BasicIntegrationTest is Test {
         }
 
         assertTrue(found, "CharOut '4' not emitted");
-        assertTrue(emu.halted(), "CPU did not halt on BRK");
+        assertTrue(emu.halted(), "CPU did not halt on HLT");
     }
 } 

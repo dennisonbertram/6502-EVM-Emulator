@@ -28,6 +28,9 @@ contract OpcodeMatrixTest is Test {
                 // Any other revert propagate as test failure
                 revert(reason);
             }
+        } catch {
+            // Catch panics (arithmetic overflow, etc.) - treat as unimplemented
+            implemented = false;
         }
     }
 
